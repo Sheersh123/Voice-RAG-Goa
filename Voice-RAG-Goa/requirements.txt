@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+streamlit
+sentence-transformers
+faiss-cpu
+datasets
+langchain-text-splitters
+google-generativeai
+requests
+numpy
+pandas
+python-dotenv
+soundfile
