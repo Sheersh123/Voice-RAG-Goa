@@ -1,55 +1,94 @@
-from datasets import load_dataset
-from sentence_transformers import SentenceTransformer
-import faiss
-import pickle
 import os
-from pathlib import Path
+import pickle
+import faiss
+import pyarrow.parquet as pq
+from huggingface_hub import hf_hub_download
+from sentence_transformers import SentenceTransformer
 
-# Root project directory
-ROOT = Path(__file__).resolve().parent.parent
-INDEX_DIR = ROOT / "index"
-INDEX_DIR.mkdir(exist_ok=True)
+REPO_ID = "ai4bharat/MSMARCO-XI"
 
-print("Loading MSMARCO-XI dataset (streaming mode)...")
+SHARDS = [
+    "tamtrain.parquet",
+    "hintrain.parquet",
+    "bentrain.parquet",
+    "gujtrain.parquet",
+    "urdtrain.parquet"
+]
 
-dataset = load_dataset(
-    "ai4bharat/MSMARCO-XI",
-    split="train",
-    streaming=True
-)
+TARGET_PER_SHARD = 10000
+BATCH_SIZE = 512
 
-texts = []
-
-# Collect only 10,000 passages
-for item in dataset:
-    if "passage" in item:
-        texts.append(item["passage"])
-    elif "text" in item:
-        texts.append(item["text"])
-
-    if len(texts) >= 10000:
-        break
-
-print(f"Collected {len(texts)} passages.")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INDEX_DIR = os.path.join(BASE_DIR, "index")
+os.makedirs(INDEX_DIR, exist_ok=True)
 
 print("Loading embedding model...")
 model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
-print("Creating embeddings...")
-embeddings = model.encode(
-    texts,
-    convert_to_numpy=True,
-    show_progress_bar=True
-)
+index = None
+texts = []
+metadata = []
 
-dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
-index.add(embeddings)
+for shard_name in SHARDS:
+    print(f"\nProcessing {shard_name}")
 
-faiss.write_index(index, str(INDEX_DIR / "msmarco.index"))
+    shard_path = hf_hub_download(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        filename=f"train/{shard_name}"
+    )
 
-with open(INDEX_DIR / "texts.pkl", "wb") as f:
+    pf = pq.ParquetFile(shard_path)
+    language = shard_name[:3]
+    collected = 0
+
+    for batch in pf.iter_batches(batch_size=BATCH_SIZE):
+        table = batch.to_pydict()
+
+        remaining = TARGET_PER_SHARD - collected
+        if remaining <= 0:
+            break
+
+        answers = table["Answer"][:remaining]
+        queries = table["query"][:remaining]
+        query_ids = table["query_id"][:remaining]
+
+        embeddings = model.encode(
+            answers,
+            batch_size=64,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+
+        if index is None:
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+
+        index.add(embeddings)
+        texts.extend(answers)
+
+        metadata.extend([
+            {
+                "query": q,
+                "query_id": qid,
+                "language": language,
+                "source": "MSMARCO-XI",
+                "chunk_type": "raw"
+            }
+            for q, qid in zip(queries, query_ids)
+        ])
+
+        collected += len(answers)
+        del embeddings
+
+    print(f"Finished {shard_name}: {collected}")
+
+faiss.write_index(index, os.path.join(INDEX_DIR, "msmarco.index"))
+
+with open(os.path.join(INDEX_DIR, "texts.pkl"), "wb") as f:
     pickle.dump(texts, f)
 
-print("Done!")
-print(f"Saved {len(texts)} passages.")
+with open(os.path.join(INDEX_DIR, "metadata.pkl"), "wb") as f:
+    pickle.dump(metadata, f)
+
+print("\nDone!")
+print(f"Indexed {len(texts)} passages.")
